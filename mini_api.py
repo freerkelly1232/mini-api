@@ -32,7 +32,7 @@ GAME_ID = os.environ.get("GAME_ID", "109983668079237")
 BASE_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public"
 
 # Main API endpoint
-MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-79f4.up.railway.app/add-pool")
+MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-0871.up.railway.app/add-pool")
 
 # Performance Tuning
 FETCH_WORKERS = 4                   # Parallel workers per cycle
@@ -45,7 +45,7 @@ BATCH_SIZE = 500                    # Send to main API in batches
 # Add your proxies here - more proxies = faster fetching
 PROXIES = [
     # Format: "http://user:pass@host:port" or "http://host:port"
-    "http://proxy-e5a1ntzmrlr3_area-VN:Ol43jGdsIuPUNacc@as.naproxy.net:1000",
+    "http://proxy-e5a1ntzmrlr3_area-US:Ol43jGdsIuPUNacc@us.naproxy.net:1000",
     # Add more proxies for better performance:
     # "http://proxy2:port",
     # "http://proxy3:port",
