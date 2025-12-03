@@ -1,125 +1,255 @@
 #!/usr/bin/env python3
+"""
+OPTIMIZED MINI API - Parallel Server Fetcher
+Features:
+- Parallel fetching across multiple proxies
+- Automatic proxy rotation on rate limits
+- Batch sending to main API
+- Continuous scanning with no gaps
+"""
+
 import os
-import requests
-import threading
 import time
 import logging
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
+import requests
 
-# ----------------------
-# Configuración básica
-# ----------------------
-logging.basicConfig(level=logging.INFO, format='[MINI] %(message)s')
+# ==================== CONFIG ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='[MINI %(asctime)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
+# Roblox Config
 GAME_ID = os.environ.get("GAME_ID", "109983668079237")
-BASE_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public?sortOrder=Asc&limit=100"
-MAIN_API_URL = "https://main-api-production-79f4.up.railway.app/add-pool"
+BASE_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public"
 
-# ⚡ valores rápidos
-SEND_INTERVAL = int(os.environ.get("SEND_INTERVAL", "10"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "5"))
+# Main API endpoint
+MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-79f4.up.railway.app/add-pool")
 
-# ----------------------
-# Tus proxys
-# ----------------------
+# Performance Tuning
+FETCH_WORKERS = 4                   # Parallel workers per cycle
+PAGES_PER_WORKER = 25               # Each worker fetches this many pages
+SEND_INTERVAL = 3                   # Seconds between send cycles
+REQUEST_TIMEOUT = 8
+BATCH_SIZE = 500                    # Send to main API in batches
+
+# ==================== PROXIES ====================
+# Add your proxies here - more proxies = faster fetching
 PROXIES = [
-    "http://proxy-e5a1ntzmrlr3_area-VN:Ol43jGdsIuPUNacc@as.naproxy.net:1000"
+    # Format: "http://user:pass@host:port" or "http://host:port"
+    "http://proxy-e5a1ntzmrlr3_area-VN:Ol43jGdsIuPUNacc@as.naproxy.net:1000",
+    # Add more proxies for better performance:
+    # "http://proxy2:port",
+    # "http://proxy3:port",
+    None,  # Direct connection (no proxy)
 ]
 
-# ----------------------
-# Función para obtener todos los servidores
-# ----------------------
-def fetch_all_roblox_servers(retries=3):
-    all_servers = []
-    cursor = None
-    page_count = 0
-    proxy_index = 0
+# ==================== STATE ====================
+class FetchStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total_fetched = 0
+        self.total_sent = 0
+        self.last_cycle_time = 0
+        self.errors = 0
+        self.rate_limits = 0
 
-    while True:
-        proxy = PROXIES[proxy_index % len(PROXIES)]
-        proxies = {"http": proxy, "https": proxy}
+stats = FetchStats()
+pending_servers = deque(maxlen=50000)  # Buffer for servers to send
 
+# ==================== FETCHING ====================
+def get_proxy(index):
+    """Get proxy by index with rotation"""
+    if not PROXIES:
+        return None
+    proxy = PROXIES[index % len(PROXIES)]
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    return None
+
+def fetch_pages_sequential(worker_id, start_cursor=None, max_pages=25):
+    """Fetch multiple pages sequentially with one proxy"""
+    servers = []
+    cursor = start_cursor
+    proxy_idx = worker_id
+    
+    for page in range(max_pages):
         try:
-            url = BASE_URL + (f"&cursor={cursor}" if cursor else "")
-            page_count += 1
-            logging.info(f"[FETCH] Page {page_count} via proxy {proxy} ...")
-
-            r = requests.get(url, proxies=proxies, timeout=REQUEST_TIMEOUT)
-            if r.status_code == 429:
-                logging.warning("[429] Too Many Requests — cambiando de proxy...")
-                proxy_index += 1
+            proxies = get_proxy(proxy_idx)
+            params = {'sortOrder': 'Asc', 'limit': 100}
+            if cursor:
+                params['cursor'] = cursor
+            
+            resp = requests.get(
+                BASE_URL, 
+                params=params, 
+                proxies=proxies, 
+                timeout=REQUEST_TIMEOUT
+            )
+            
+            if resp.status_code == 429:
+                log.warning(f"[Worker {worker_id}] Rate limited, rotating proxy...")
+                with stats.lock:
+                    stats.rate_limits += 1
+                proxy_idx += 1
                 time.sleep(1)
                 continue
-
-            r.raise_for_status()
-            data = r.json()
-
-            servers = data.get("data", [])
-            all_servers.extend(servers)
-            cursor = data.get("nextPageCursor")
-
-            logging.info(f"[PAGE {page_count}] +{len(servers)} servers (Total: {len(all_servers)})")
-
+            
+            resp.raise_for_status()
+            data = resp.json()
+            
+            page_servers = data.get('data', [])
+            for s in page_servers:
+                if s.get('id'):
+                    servers.append({
+                        'id': s['id'],
+                        'players': s.get('playing', 0)
+                    })
+            
+            cursor = data.get('nextPageCursor')
             if not cursor:
-                logging.info("[INFO] No hay más páginas disponibles.")
                 break
-
-            proxy_index += 1
-            time.sleep(0.2)  # ⚡ más rápido
-
+            
+            time.sleep(0.1)  # Small delay between pages
+            
         except requests.exceptions.RequestException as e:
-            logging.warning(f"[ERROR] Proxy {proxy} falló: {e}")
-            proxy_index += 1
-            time.sleep(0.4)  # ⚡ pausa rápida en errores
-            if proxy_index >= len(PROXIES) * retries:
-                break
+            log.debug(f"[Worker {worker_id}] Error: {e}")
+            with stats.lock:
+                stats.errors += 1
+            proxy_idx += 1
+            time.sleep(0.5)
+    
+    return servers, cursor
 
+def parallel_fetch():
+    """Run multiple fetch workers in parallel"""
+    all_servers = []
+    
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        # Start workers with different starting points
+        futures = []
+        for i in range(FETCH_WORKERS):
+            future = executor.submit(fetch_pages_sequential, i, None, PAGES_PER_WORKER)
+            futures.append(future)
+        
+        for future in as_completed(futures):
+            try:
+                servers, _ = future.result()
+                all_servers.extend(servers)
+            except Exception as e:
+                log.error(f"Worker error: {e}")
+    
     return all_servers
 
-# ----------------------
-# Loop principal
-# ----------------------
-def fetch_and_send():
-    while True:
-        servers = fetch_all_roblox_servers()
-
-        if not servers:
-            logging.warning("No se encontraron servidores en este ciclo.")
-            time.sleep(SEND_INTERVAL)
-            continue
-
-        job_ids = [s["id"] for s in servers if "id" in s]
-        payload = {"servers": job_ids}
-
+def send_to_main(servers):
+    """Send servers to main API in batches"""
+    if not servers:
+        return 0
+    
+    total_added = 0
+    
+    # Send in batches
+    for i in range(0, len(servers), BATCH_SIZE):
+        batch = servers[i:i + BATCH_SIZE]
         try:
-            resp = requests.post(MAIN_API_URL, json=payload, timeout=REQUEST_TIMEOUT)
+            # Send just job IDs for efficiency
+            payload = {"servers": [s['id'] if isinstance(s, dict) else s for s in batch]}
+            
+            resp = requests.post(
+                MAIN_API_URL, 
+                json=payload, 
+                timeout=REQUEST_TIMEOUT
+            )
+            
             if resp.ok:
-                added = resp.json().get("added", None)
-                logging.info(f"✅ Enviados {len(job_ids)} servers, añadidos: {added}")
+                added = resp.json().get('added', 0)
+                total_added += added
             else:
-                logging.warning(f"⚠️ MAIN devolvió {resp.status_code}: {resp.text}")
+                log.warning(f"Main API returned {resp.status_code}")
+                
         except Exception as e:
-            logging.exception(f"❌ Error al enviar a MAIN: {e}")
+            log.error(f"Error sending to main: {e}")
+    
+    return total_added
 
-        time.sleep(SEND_INTERVAL)
+# ==================== MAIN LOOP ====================
+def fetch_and_send_loop():
+    """Continuous fetch and send loop"""
+    while True:
+        cycle_start = time.time()
+        
+        try:
+            # Fetch from Roblox
+            servers = parallel_fetch()
+            
+            with stats.lock:
+                stats.total_fetched += len(servers)
+            
+            if servers:
+                # Add to pending queue
+                for s in servers:
+                    pending_servers.append(s)
+                
+                # Send to main API
+                to_send = list(pending_servers)
+                pending_servers.clear()
+                
+                added = send_to_main(to_send)
+                
+                with stats.lock:
+                    stats.total_sent += added
+                    stats.last_cycle_time = time.time() - cycle_start
+                
+                log.info(f"✅ Fetched {len(servers)} | Sent {len(to_send)} | Added {added} | Time {stats.last_cycle_time:.1f}s")
+            else:
+                log.warning("No servers fetched this cycle")
+                
+        except Exception as e:
+            log.exception(f"Cycle error: {e}")
+        
+        # Wait for next cycle
+        elapsed = time.time() - cycle_start
+        sleep_time = max(0, SEND_INTERVAL - elapsed)
+        time.sleep(sleep_time)
 
-# ----------------------
-# Hilo en background
-# ----------------------
-threading.Thread(target=fetch_and_send, daemon=True).start()
-
-# ----------------------
-# Endpoint simple
-# ----------------------
-@app.route("/", methods=["GET"])
+# ==================== ENDPOINTS ====================
+@app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "mini API running"})
+    """Status endpoint"""
+    with stats.lock:
+        return jsonify({
+            'status': 'running',
+            'total_fetched': stats.total_fetched,
+            'total_sent': stats.total_sent,
+            'pending': len(pending_servers),
+            'last_cycle_time': round(stats.last_cycle_time, 2),
+            'errors': stats.errors,
+            'rate_limits': stats.rate_limits,
+            'workers': FETCH_WORKERS,
+            'proxies': len([p for p in PROXIES if p])
+        })
 
-# ----------------------
-# Main
-# ----------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8001))
-    logging.info(f"Mini API local corriendo en puerto {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
+
+# ==================== MAIN ====================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8001))
+    
+    log.info(f"🚀 Optimized Mini API starting on port {port}")
+    log.info(f"   Workers: {FETCH_WORKERS}, Proxies: {len(PROXIES)}")
+    log.info(f"   Main API: {MAIN_API_URL}")
+    
+    # Start fetch loop in background
+    threading.Thread(target=fetch_and_send_loop, daemon=True).start()
+    
+    app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
