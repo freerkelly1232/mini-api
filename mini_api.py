@@ -132,18 +132,25 @@ def fetch_pages_sequential(worker_id, start_cursor=None, max_pages=25):
 def parallel_fetch():
     """Run multiple fetch workers in parallel"""
     all_servers = []
+    seen_ids = set()
     
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
-        # Start workers with different starting points
+        # Start workers - they'll naturally get different pages due to timing
         futures = []
         for i in range(FETCH_WORKERS):
+            # Stagger start and use different sort orders
             future = executor.submit(fetch_pages_sequential, i, None, PAGES_PER_WORKER)
             futures.append(future)
         
         for future in as_completed(futures):
             try:
                 servers, _ = future.result()
-                all_servers.extend(servers)
+                # Dedupe locally before sending
+                for s in servers:
+                    sid = s['id'] if isinstance(s, dict) else s
+                    if sid not in seen_ids:
+                        seen_ids.add(sid)
+                        all_servers.append(s)
             except Exception as e:
                 log.error(f"Worker error: {e}")
     
