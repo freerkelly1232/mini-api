@@ -45,7 +45,7 @@ BATCH_SIZE = 500                    # Send to main API in batches
 # Add your proxies here - more proxies = faster fetching
 PROXIES = [
     # Format: "http://user:pass@host:port" or "http://host:port"
-    "http://proxy-e5a1ntzmrlr3_area-US:Ol43jGdsIuPUNacc@us.naproxy.net:1000",
+    "http://proxy-e5a1ntzmrlr3:Ol43jGdsIuPUNacc@eu.naproxy.net:1000",
     # Add more proxies for better performance:
     # "http://proxy2:port",
     # "http://proxy3:port",
