@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MINI API - Additional Server Fetcher
+MINI API v2 - EU Region Fetcher
+Fetches from different region for more server diversity
 """
 
 import os
@@ -17,17 +18,18 @@ import random
 PLACE_ID = 109983668079237
 MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-0871.up.railway.app")
 
-# NAProxy - EU endpoint
-PROXY_HOST = "eu.naproxy.net"
+# NAProxy - US endpoint
+PROXY_HOST = "us.naproxy.net"
 PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Fetching
-FETCH_THREADS = 15
-FETCH_INTERVAL = 2
-PAGES_PER_CYCLE = 80
+# Deep fetching config
+FETCH_THREADS = 20
+FETCH_INTERVAL = 1
+PAGES_PER_CYCLE = 100
 SEND_BATCH_SIZE = 500
+MAX_CURSORS = 1000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +52,11 @@ class Stats:
 
 stats = Stats()
 
+# Cursor storage for deep pagination
+cursors_asc = deque(maxlen=MAX_CURSORS)
+cursors_desc = deque(maxlen=MAX_CURSORS)
+cursor_lock = threading.Lock()
+
 # ==================== PROXY ====================
 def get_proxy():
     session_id = f"mini{random.randint(100000, 999999)}"
@@ -57,10 +64,10 @@ def get_proxy():
     return {'http': proxy_url, 'https': proxy_url}
 
 # ==================== FETCHING ====================
-def fetch_page(cursor=None):
+def fetch_page(cursor=None, sort_order='Desc'):
     try:
         url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-        params = {'sortOrder': 'Desc', 'limit': 100}
+        params = {'sortOrder': sort_order, 'limit': 100}
         if cursor:
             params['cursor'] = cursor
         
@@ -74,43 +81,73 @@ def fetch_page(cursor=None):
         
         if resp.status_code == 200:
             data = resp.json()
-            return data.get('data', []), data.get('nextPageCursor')
-        return [], None
+            return data.get('data', []), data.get('nextPageCursor'), sort_order
+        return [], None, sort_order
         
     except Exception as e:
         with stats.lock:
             stats.errors += 1
-        return [], None
+        return [], None, sort_order
 
 def fetch_cycle():
-    cursors = [None] * FETCH_THREADS
+    global cursors_asc, cursors_desc
+    
+    # Build fetch list - mix of fresh and deep cursors
+    fetches = []
+    
+    # Fresh fetches (no cursor)
+    fetches.append((None, 'Asc'))
+    fetches.append((None, 'Desc'))
+    
+    # Add cursors from different depths
+    with cursor_lock:
+        asc_list = list(cursors_asc)
+        desc_list = list(cursors_desc)
+        
+        # Sample from different depths
+        for i in range(0, len(asc_list), max(1, len(asc_list) // 20)):
+            if len(fetches) < PAGES_PER_CYCLE // 2:
+                fetches.append((asc_list[i], 'Asc'))
+        
+        for i in range(0, len(desc_list), max(1, len(desc_list) // 20)):
+            if len(fetches) < PAGES_PER_CYCLE:
+                fetches.append((desc_list[i], 'Desc'))
+    
+    fetches = fetches[:PAGES_PER_CYCLE]
+    
     all_servers = []
     seen = set()
+    new_cursors_asc = []
+    new_cursors_desc = []
     
-    for _ in range(PAGES_PER_CYCLE // FETCH_THREADS):
-        with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
-            futures = {executor.submit(fetch_page, c): i for i, c in enumerate(cursors)}
-            
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    servers, next_cursor = future.result()
-                    
-                    for s in servers:
-                        sid = s.get('id')
-                        if sid and sid not in seen:
-                            seen.add(sid)
-                            all_servers.append({'id': sid, 'players': s.get('playing', 0)})
-                    
-                    if next_cursor:
-                        cursors[idx] = next_cursor
-                    else:
-                        cursors[idx] = None
-                        
-                except Exception as e:
-                    pass
+    with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
+        futures = {executor.submit(fetch_page, c, s): (c, s) for c, s in fetches}
         
-        time.sleep(0.1)
+        for future in as_completed(futures):
+            try:
+                servers, next_cursor, sort_order = future.result()
+                
+                for s in servers:
+                    sid = s.get('id')
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        all_servers.append({'id': sid, 'players': s.get('playing', 0)})
+                
+                if next_cursor:
+                    if sort_order == 'Asc':
+                        new_cursors_asc.append(next_cursor)
+                    else:
+                        new_cursors_desc.append(next_cursor)
+                        
+            except Exception as e:
+                pass
+    
+    # Store new cursors
+    with cursor_lock:
+        for c in new_cursors_asc:
+            cursors_asc.append(c)
+        for c in new_cursors_desc:
+            cursors_desc.append(c)
     
     return all_servers
 
@@ -125,7 +162,7 @@ def send_to_main(servers):
         try:
             resp = requests.post(
                 f"{MAIN_API_URL}/add-pool",
-                json={'servers': batch, 'source': 'mini-api'},
+                json={'servers': batch, 'source': 'mini-api-eu'},
                 timeout=10
             )
             if resp.ok:
@@ -159,7 +196,9 @@ def run_loop():
             if time.time() - last_log >= 60:
                 with stats.lock:
                     stats.last_rate = servers_this_min
-                log.info(f"[RATE] {servers_this_min}/min | Total sent: {stats.sent} | Added: {stats.added}")
+                with cursor_lock:
+                    cursor_count = len(cursors_asc) + len(cursors_desc)
+                log.info(f"[RATE] {servers_this_min}/min | Sent: {stats.sent} | Added: {stats.added} | Cursors: {cursor_count}")
                 servers_this_min = 0
                 last_log = time.time()
                 
@@ -173,14 +212,18 @@ def run_loop():
 @app.route('/status', methods=['GET'])
 def status():
     with stats.lock:
-        return jsonify({
-            'status': 'running',
-            'fetched': stats.fetched,
-            'sent': stats.sent,
-            'added': stats.added,
-            'errors': stats.errors,
-            'rate_per_min': stats.last_rate
-        })
+        with cursor_lock:
+            return jsonify({
+                'status': 'running',
+                'region': 'EU',
+                'fetched': stats.fetched,
+                'sent': stats.sent,
+                'added': stats.added,
+                'errors': stats.errors,
+                'rate_per_min': stats.last_rate,
+                'cursors_asc': len(cursors_asc),
+                'cursors_desc': len(cursors_desc)
+            })
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -190,17 +233,9 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8001))
     
-    log.info(f"[STARTUP] Mini API on port {port}")
-    log.info(f"[CONFIG] Threads={FETCH_THREADS} | Main API={MAIN_API_URL}")
+    log.info(f"[STARTUP] Mini API v2 (EU) on port {port}")
+    log.info(f"[CONFIG] Deep pagination enabled | Threads={FETCH_THREADS}")
     
     threading.Thread(target=run_loop, daemon=True).start()
     
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
-```
-
----
-
-## Requirements.txt (for both)
-```
-flask
-requests
