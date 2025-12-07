@@ -1,6 +1,6 @@
-q#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-MINI API v3 - Deep Pagination Helper
+MINI API - Deep Pagination Helper
 """
 
 import os
@@ -89,11 +89,9 @@ def fetch_page(cursor=None, sort_order='Desc'):
 def fetch_cycle():
     fetches = []
     
-    # Fresh
     fetches.append((None, 'Asc'))
     fetches.append((None, 'Desc'))
     
-    # Deep cursors
     with cursor_lock:
         asc_list = list(cursors_asc)
         desc_list = list(cursors_desc)
@@ -220,6 +218,6 @@ def health():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8001))
-    log.info(f"[STARTUP] Mini API v3 on port {port}")
+    log.info(f"[STARTUP] Mini API on port {port}")
     threading.Thread(target=run_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
