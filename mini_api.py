@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+q#!/usr/bin/env python3
 """
 MINI API v3 - Deep Pagination Helper
 """
