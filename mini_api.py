@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-MINI API - ULTIMATE SERVER HOPPER HELPER
-- Deep pagination (separate cursor pool)
-- Both Asc + Desc fetching  
-- Sends unique servers to Main API
-- Runs alongside Main API for 2x coverage
+MINI API - Additional Server Fetcher
 """
 
 import os
@@ -21,18 +17,17 @@ import random
 PLACE_ID = 109983668079237
 MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-0871.up.railway.app")
 
-# NAProxy
+# NAProxy - US endpoint
 PROXY_HOST = "us.naproxy.net"
 PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Moderate fetching (~4k servers/min)
+# Fetching
 FETCH_THREADS = 15
-FETCH_INTERVAL = 1
+FETCH_INTERVAL = 2
 PAGES_PER_CYCLE = 80
 SEND_BATCH_SIZE = 500
-MAX_CURSORS = 1500
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,21 +46,9 @@ class Stats:
         self.sent = 0
         self.added = 0
         self.errors = 0
-        self.pages = 0
         self.last_rate = 0
-        self.last_added_rate = 0
 
 stats = Stats()
-
-# Cursor storage for deep pagination
-cursors_asc = deque(maxlen=MAX_CURSORS)
-cursors_desc = deque(maxlen=MAX_CURSORS)
-cursor_lock = threading.Lock()
-
-# Local dedup to avoid sending same servers repeatedly
-local_seen = set()
-local_seen_lock = threading.Lock()
-MAX_LOCAL_SEEN = 100000
 
 # ==================== PROXY ====================
 def get_proxy():
@@ -74,10 +57,10 @@ def get_proxy():
     return {'http': proxy_url, 'https': proxy_url}
 
 # ==================== FETCHING ====================
-def fetch_page(cursor=None, sort_order='Desc'):
+def fetch_page(cursor=None):
     try:
         url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-        params = {'sortOrder': sort_order, 'limit': 100}
+        params = {'sortOrder': 'Desc', 'limit': 100}
         if cursor:
             params['cursor'] = cursor
         
@@ -86,124 +69,48 @@ def fetch_page(cursor=None, sort_order='Desc'):
             params=params,
             proxies=get_proxy(),
             timeout=10,
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'application/json'
-            }
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
         )
         
         if resp.status_code == 200:
             data = resp.json()
-            return data.get('data', []), data.get('nextPageCursor'), sort_order
-        elif resp.status_code == 429:
-            log.warning(f"[RATELIMIT] 429 from Roblox")
-            time.sleep(2)
-            return [], None, sort_order
-        else:
-            log.warning(f"[FETCH] Status {resp.status_code}")
-            return [], None, sort_order
+            return data.get('data', []), data.get('nextPageCursor')
+        return [], None
         
-    except requests.exceptions.ProxyError as e:
-        log.error(f"[PROXY ERROR] {e}")
-        with stats.lock:
-            stats.errors += 1
-        return [], None, sort_order
-    except requests.exceptions.Timeout:
-        log.warning("[TIMEOUT] Request timed out")
-        with stats.lock:
-            stats.errors += 1
-        return [], None, sort_order
     except Exception as e:
-        log.error(f"[ERROR] {e}")
         with stats.lock:
             stats.errors += 1
-        return [], None, sort_order
+        return [], None
 
 def fetch_cycle():
-    global local_seen
-    
-    fetches = []
-    
-    # Fresh fetches (both directions)
-    fetches.append((None, 'Asc'))
-    fetches.append((None, 'Desc'))
-    
-    # Sample from stored cursors at different depths
-    with cursor_lock:
-        asc_list = list(cursors_asc)
-        desc_list = list(cursors_desc)
-        
-        # Evenly sample from Asc cursors
-        if asc_list:
-            step = max(1, len(asc_list) // 50)
-            for i in range(0, len(asc_list), step):
-                fetches.append((asc_list[i], 'Asc'))
-        
-        # Evenly sample from Desc cursors
-        if desc_list:
-            step = max(1, len(desc_list) // 50)
-            for i in range(0, len(desc_list), step):
-                fetches.append((desc_list[i], 'Desc'))
-    
-    # Limit fetches per cycle
-    fetches = fetches[:PAGES_PER_CYCLE]
-    
+    cursors = [None] * FETCH_THREADS
     all_servers = []
-    new_cursors_asc = []
-    new_cursors_desc = []
-    pages_fetched = 0
+    seen = set()
     
-    # Execute in parallel
-    with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
-        futures = {executor.submit(fetch_page, c, s): (c, s) for c, s in fetches}
-        
-        for future in as_completed(futures):
-            try:
-                servers, next_cursor, sort_order = future.result()
-                pages_fetched += 1
-                
-                for s in servers:
-                    sid = s.get('id')
-                    players = s.get('playing', 0)
+    for _ in range(PAGES_PER_CYCLE // FETCH_THREADS):
+        with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
+            futures = {executor.submit(fetch_page, c): i for i, c in enumerate(cursors)}
+            
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    servers, next_cursor = future.result()
                     
-                    if not sid:
-                        continue
+                    for s in servers:
+                        sid = s.get('id')
+                        if sid and sid not in seen:
+                            seen.add(sid)
+                            all_servers.append({'id': sid, 'players': s.get('playing', 0)})
                     
-                    # Skip servers with <5 or 8 players
-                    if players < 5 or players >= 8:
-                        continue
-                    
-                    # Skip if we've seen it locally (avoid re-sending)
-                    with local_seen_lock:
-                        if sid in local_seen:
-                            continue
-                        local_seen.add(sid)
-                        
-                        # Trim local seen
-                        if len(local_seen) > MAX_LOCAL_SEEN:
-                            local_seen = set(list(local_seen)[-50000:])
-                    
-                    all_servers.append({'id': sid, 'players': players})
-                
-                if next_cursor:
-                    if sort_order == 'Asc':
-                        new_cursors_asc.append(next_cursor)
+                    if next_cursor:
+                        cursors[idx] = next_cursor
                     else:
-                        new_cursors_desc.append(next_cursor)
+                        cursors[idx] = None
                         
-            except Exception as e:
-                pass
-    
-    # Store new cursors
-    with cursor_lock:
-        for c in new_cursors_asc:
-            cursors_asc.append(c)
-        for c in new_cursors_desc:
-            cursors_desc.append(c)
-    
-    with stats.lock:
-        stats.fetched += len(all_servers)
-        stats.pages += pages_fetched
+                except Exception as e:
+                    pass
+        
+        time.sleep(0.1)
     
     return all_servers
 
@@ -213,63 +120,47 @@ def send_to_main(servers):
     
     total_added = 0
     
-    # Send in batches
     for i in range(0, len(servers), SEND_BATCH_SIZE):
         batch = servers[i:i + SEND_BATCH_SIZE]
         try:
             resp = requests.post(
                 f"{MAIN_API_URL}/add-pool",
                 json={'servers': batch, 'source': 'mini-api'},
-                timeout=15
+                timeout=10
             )
             if resp.ok:
-                result = resp.json()
-                total_added += result.get('added', 0)
+                total_added += resp.json().get('added', 0)
         except Exception as e:
             log.error(f"Send error: {e}")
-            with stats.lock:
-                stats.errors += 1
     
     return total_added
 
+# ==================== MAIN LOOP ====================
 def run_loop():
     last_log = time.time()
     servers_this_min = 0
-    added_this_min = 0
-    pages_this_min = 0
     
     while True:
         try:
-            # Fetch servers
             servers = fetch_cycle()
-            servers_this_min += len(servers)
             
             with stats.lock:
-                pages_this_min = stats.pages
+                stats.fetched += len(servers)
             
-            # Send to main API
             if servers:
                 added = send_to_main(servers)
-                added_this_min += added
                 
                 with stats.lock:
                     stats.sent += len(servers)
                     stats.added += added
+                
+                servers_this_min += len(servers)
             
-            # Log every minute
             if time.time() - last_log >= 60:
                 with stats.lock:
                     stats.last_rate = servers_this_min
-                    stats.last_added_rate = added_this_min
-                
-                with cursor_lock:
-                    cursor_count = len(cursors_asc) + len(cursors_desc)
-                
-                log.info(f"[MINI] Fetched: {servers_this_min}/min | Added: {added_this_min}/min | Cursors: {cursor_count} | Total sent: {stats.sent}")
-                
+                log.info(f"[RATE] {servers_this_min}/min | Total sent: {stats.sent} | Added: {stats.added}")
                 servers_this_min = 0
-                added_this_min = 0
-                pages_this_min = 0
                 last_log = time.time()
                 
         except Exception as e:
@@ -279,57 +170,29 @@ def run_loop():
 
 # ==================== ENDPOINTS ====================
 @app.route('/', methods=['GET'])
-def root():
-    return jsonify({
-        'service': 'Mini API - Server Hopper Helper',
-        'status': 'running',
-        'main_api': MAIN_API_URL
-    })
-
 @app.route('/status', methods=['GET'])
 def status():
     with stats.lock:
-        with cursor_lock:
-            with local_seen_lock:
-                return jsonify({
-                    'status': 'running',
-                    'fetched_total': stats.fetched,
-                    'sent_total': stats.sent,
-                    'added_total': stats.added,
-                    'errors': stats.errors,
-                    'rate_fetched': stats.last_rate,
-                    'rate_added': stats.last_added_rate,
-                    'cursors_asc': len(cursors_asc),
-                    'cursors_desc': len(cursors_desc),
-                    'cursors_total': len(cursors_asc) + len(cursors_desc),
-                    'local_seen': len(local_seen),
-                    'main_api': MAIN_API_URL
-                })
+        return jsonify({
+            'status': 'running',
+            'fetched': stats.fetched,
+            'sent': stats.sent,
+            'added': stats.added,
+            'errors': stats.errors,
+            'rate_per_min': stats.last_rate
+        })
 
 @app.route('/health', methods=['GET'])
 def health():
-    with stats.lock:
-        return jsonify({
-            'status': 'ok',
-            'sent': stats.sent,
-            'added': stats.added
-        })
+    return jsonify({'status': 'ok'})
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8001))
     
-    log.info("=" * 60)
-    log.info("  MINI API - SERVER HOPPER HELPER")
-    log.info("=" * 60)
-    log.info(f"  Port: {port}")
-    log.info(f"  Main API: {MAIN_API_URL}")
-    log.info(f"  Fetch Threads: {FETCH_THREADS}")
-    log.info(f"  Max Cursors: {MAX_CURSORS}")
-    log.info("=" * 60)
+    log.info(f"[STARTUP] Mini API on port {port}")
+    log.info(f"[CONFIG] Threads={FETCH_THREADS} | Main API={MAIN_API_URL}")
     
-    # Start fetcher loop
     threading.Thread(target=run_loop, daemon=True).start()
     
-    # Start Flask
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
