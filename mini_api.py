@@ -27,12 +27,12 @@ PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Gentle fetching (proxy friendly)
-FETCH_THREADS = 8
-FETCH_INTERVAL = 2
-PAGES_PER_CYCLE = 40
+# Moderate fetching (~4k servers/min)
+FETCH_THREADS = 15
+FETCH_INTERVAL = 1
+PAGES_PER_CYCLE = 80
 SEND_BATCH_SIZE = 500
-MAX_CURSORS = 800
+MAX_CURSORS = 1500
 
 logging.basicConfig(
     level=logging.INFO,
