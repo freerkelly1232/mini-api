@@ -155,6 +155,10 @@ def fetch_cycle():
                     if not sid:
                         continue
                     
+                    # Skip servers with <5 or 8 players
+                    if players < 5 or players >= 8:
+                        continue
+                    
                     # Skip if we've seen it locally (avoid re-sending)
                     with local_seen_lock:
                         if sid in local_seen:
@@ -315,4 +319,3 @@ if __name__ == '__main__':
     
     # Start Flask
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
-
