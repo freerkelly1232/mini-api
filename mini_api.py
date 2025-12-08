@@ -8,10 +8,14 @@ import time
 import logging
 import threading
 import requests
+import urllib3
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 import random
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==================== CONFIG ====================
 PLACE_ID = 109983668079237
@@ -24,9 +28,9 @@ PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
 # Reduced fetching (proxy friendly)
-FETCH_THREADS = 6
-FETCH_INTERVAL = 2
-PAGES_PER_CYCLE = 30
+FETCH_THREADS = 4
+FETCH_INTERVAL = 3
+PAGES_PER_CYCLE = 20
 SEND_BATCH_SIZE = 500
 
 logging.basicConfig(
@@ -63,7 +67,7 @@ def get_proxy():
 
 # ==================== FETCHING ====================
 def fetch_page(cursor=None, sort_order='Desc'):
-    max_retries = 2
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
@@ -80,6 +84,7 @@ def fetch_page(cursor=None, sort_order='Desc'):
                 params=params,
                 proxies=get_proxy(),
                 timeout=15,
+                verify=False,  # Disable SSL verification for proxy
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
             )
             
