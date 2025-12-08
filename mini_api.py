@@ -96,11 +96,25 @@ def fetch_page(cursor=None, sort_order='Desc'):
             data = resp.json()
             return data.get('data', []), data.get('nextPageCursor'), sort_order
         elif resp.status_code == 429:
-            time.sleep(1)
+            log.warning(f"[RATELIMIT] 429 from Roblox")
+            time.sleep(2)
             return [], None, sort_order
-        return [], None, sort_order
+        else:
+            log.warning(f"[FETCH] Status {resp.status_code}")
+            return [], None, sort_order
         
+    except requests.exceptions.ProxyError as e:
+        log.error(f"[PROXY ERROR] {e}")
+        with stats.lock:
+            stats.errors += 1
+        return [], None, sort_order
+    except requests.exceptions.Timeout:
+        log.warning("[TIMEOUT] Request timed out")
+        with stats.lock:
+            stats.errors += 1
+        return [], None, sort_order
     except Exception as e:
+        log.error(f"[ERROR] {e}")
         with stats.lock:
             stats.errors += 1
         return [], None, sort_order
