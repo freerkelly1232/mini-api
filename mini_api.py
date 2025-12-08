@@ -23,10 +23,10 @@ PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Fetching
-FETCH_THREADS = 15
+# Reduced fetching (proxy friendly)
+FETCH_THREADS = 6
 FETCH_INTERVAL = 2
-PAGES_PER_CYCLE = 80
+PAGES_PER_CYCLE = 30
 SEND_BATCH_SIZE = 500
 
 logging.basicConfig(
@@ -58,29 +58,43 @@ def get_proxy():
 
 # ==================== FETCHING ====================
 def fetch_page(cursor=None):
-    try:
-        url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-        params = {'sortOrder': 'Desc', 'limit': 100}
-        if cursor:
-            params['cursor'] = cursor
-        
-        resp = requests.get(
-            url,
-            params=params,
-            proxies=get_proxy(),
-            timeout=10,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
-        )
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get('data', []), data.get('nextPageCursor')
-        return [], None
-        
-    except Exception as e:
-        with stats.lock:
-            stats.errors += 1
-        return [], None
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+            params = {'sortOrder': 'Desc', 'limit': 100}
+            if cursor:
+                params['cursor'] = cursor
+            
+            resp = requests.get(
+                url,
+                params=params,
+                proxies=get_proxy(),
+                timeout=15,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('data', []), data.get('nextPageCursor')
+            elif resp.status_code == 429:
+                time.sleep(2)
+                return [], None
+            return [], None
+            
+        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            with stats.lock:
+                stats.errors += 1
+            return [], None
+        except Exception as e:
+            with stats.lock:
+                stats.errors += 1
+            return [], None
+    
+    return [], None
 
 def fetch_cycle():
     cursors = [None] * FETCH_THREADS
@@ -98,9 +112,15 @@ def fetch_cycle():
                     
                     for s in servers:
                         sid = s.get('id')
+                        players = s.get('playing', 0)
+                        
+                        # Skip <5 or 8 players
+                        if players < 5 or players >= 8:
+                            continue
+                        
                         if sid and sid not in seen:
                             seen.add(sid)
-                            all_servers.append({'id': sid, 'players': s.get('playing', 0)})
+                            all_servers.append({'id': sid, 'players': players})
                     
                     if next_cursor:
                         cursors[idx] = next_cursor
@@ -110,7 +130,7 @@ def fetch_cycle():
                 except Exception as e:
                     pass
         
-        time.sleep(0.1)
+        time.sleep(0.2)
     
     return all_servers
 
@@ -159,7 +179,7 @@ def run_loop():
             if time.time() - last_log >= 60:
                 with stats.lock:
                     stats.last_rate = servers_this_min
-                log.info(f"[RATE] {servers_this_min}/min | Total sent: {stats.sent} | Added: {stats.added}")
+                log.info(f"[RATE] {servers_this_min}/min | Total sent: {stats.sent} | Added: {stats.added} | Errors: {stats.errors}")
                 servers_this_min = 0
                 last_log = time.time()
                 
