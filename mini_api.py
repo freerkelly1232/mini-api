@@ -50,6 +50,11 @@ class Stats:
 
 stats = Stats()
 
+# Deep cursor storage for both directions
+cursors_asc = deque(maxlen=1500)
+cursors_desc = deque(maxlen=1500)
+cursor_lock = threading.Lock()
+
 # ==================== PROXY ====================
 def get_proxy():
     session_id = f"mini{random.randint(100000, 999999)}"
@@ -57,12 +62,16 @@ def get_proxy():
     return {'http': proxy_url, 'https': proxy_url}
 
 # ==================== FETCHING ====================
-def fetch_page(cursor=None):
+def fetch_page(cursor=None, sort_order='Desc'):
     max_retries = 2
     for attempt in range(max_retries):
         try:
             url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-            params = {'sortOrder': 'Desc', 'limit': 100}
+            params = {
+                'sortOrder': sort_order,
+                'limit': 100,
+                'excludeFullGames': 'true'
+            }
             if cursor:
                 params['cursor'] = cursor
             
@@ -76,61 +85,110 @@ def fetch_page(cursor=None):
             
             if resp.status_code == 200:
                 data = resp.json()
-                return data.get('data', []), data.get('nextPageCursor')
+                return data.get('data', []), data.get('nextPageCursor'), sort_order
             elif resp.status_code == 429:
+                log.warning("[RATELIMIT] 429 from Roblox")
                 time.sleep(2)
-                return [], None
-            return [], None
+                return [], None, sort_order
+            else:
+                log.warning(f"[FETCH] Status {resp.status_code}")
+                return [], None, sort_order
             
-        except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
+        except requests.exceptions.SSLError as e:
+            log.error(f"[SSL ERROR] {e}")
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
             with stats.lock:
                 stats.errors += 1
-            return [], None
-        except Exception as e:
+            return [], None, sort_order
+        except requests.exceptions.ConnectionError as e:
+            log.error(f"[CONN ERROR] {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
             with stats.lock:
                 stats.errors += 1
-            return [], None
+            return [], None, sort_order
+        except requests.exceptions.ProxyError as e:
+            log.error(f"[PROXY ERROR] {e}")
+            with stats.lock:
+                stats.errors += 1
+            return [], None, sort_order
+        except Exception as e:
+            log.error(f"[ERROR] {type(e).__name__}: {e}")
+            with stats.lock:
+                stats.errors += 1
+            return [], None, sort_order
     
-    return [], None
+    return [], None, sort_order
 
 def fetch_cycle():
-    cursors = [None] * FETCH_THREADS
+    global cursors_asc, cursors_desc
+    
+    fetches = []
+    
+    # Start fresh from both ends
+    fetches.append((None, 'Asc'))
+    fetches.append((None, 'Desc'))
+    
+    # Prioritize DEEP cursors (closer to middle where 5-7 player servers are)
+    with cursor_lock:
+        asc_list = list(cursors_asc)
+        desc_list = list(cursors_desc)
+        
+        # Take deepest cursors (end of list)
+        if asc_list:
+            deep_asc = asc_list[-min(15, len(asc_list)):]
+            for c in deep_asc:
+                fetches.append((c, 'Asc'))
+        
+        if desc_list:
+            deep_desc = desc_list[-min(15, len(desc_list)):]
+            for c in deep_desc:
+                fetches.append((c, 'Desc'))
+    
+    fetches = fetches[:PAGES_PER_CYCLE]
+    
     all_servers = []
     seen = set()
+    new_asc = []
+    new_desc = []
     
-    for _ in range(PAGES_PER_CYCLE // FETCH_THREADS):
-        with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
-            futures = {executor.submit(fetch_page, c): i for i, c in enumerate(cursors)}
-            
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    servers, next_cursor = future.result()
-                    
-                    for s in servers:
-                        sid = s.get('id')
-                        players = s.get('playing', 0)
-                        
-                        # Skip <5 or 8 players
-                        if players < 5 or players >= 8:
-                            continue
-                        
-                        if sid and sid not in seen:
-                            seen.add(sid)
-                            all_servers.append({'id': sid, 'players': players})
-                    
-                    if next_cursor:
-                        cursors[idx] = next_cursor
-                    else:
-                        cursors[idx] = None
-                        
-                except Exception as e:
-                    pass
+    with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
+        futures = {executor.submit(fetch_page, c, s): (c, s) for c, s in fetches}
         
-        time.sleep(0.2)
+        for future in as_completed(futures):
+            try:
+                servers, next_cursor, sort_order = future.result()
+                
+                for s in servers:
+                    sid = s.get('id')
+                    players = s.get('playing', 0)
+                    
+                    # Skip servers with less than 5 players
+                    if players < 5:
+                        continue
+                    
+                    if sid and sid not in seen:
+                        seen.add(sid)
+                        all_servers.append({'id': sid, 'players': players})
+                
+                if next_cursor:
+                    if sort_order == 'Asc':
+                        new_asc.append(next_cursor)
+                    else:
+                        new_desc.append(next_cursor)
+                        
+            except Exception as e:
+                log.error(f"[CYCLE] Future error: {e}")
+    
+    # Store new cursors (go deeper)
+    with cursor_lock:
+        for c in new_asc:
+            cursors_asc.append(c)
+        for c in new_desc:
+            cursors_desc.append(c)
     
     return all_servers
 
@@ -179,7 +237,9 @@ def run_loop():
             if time.time() - last_log >= 60:
                 with stats.lock:
                     stats.last_rate = servers_this_min
-                log.info(f"[RATE] {servers_this_min}/min | Total sent: {stats.sent} | Added: {stats.added} | Errors: {stats.errors}")
+                with cursor_lock:
+                    depth = len(cursors_asc) + len(cursors_desc)
+                log.info(f"[RATE] {servers_this_min}/min | Sent: {stats.sent} | Added: {stats.added} | Depth: {depth}")
                 servers_this_min = 0
                 last_log = time.time()
                 
@@ -193,14 +253,18 @@ def run_loop():
 @app.route('/status', methods=['GET'])
 def status():
     with stats.lock:
-        return jsonify({
-            'status': 'running',
-            'fetched': stats.fetched,
-            'sent': stats.sent,
-            'added': stats.added,
-            'errors': stats.errors,
-            'rate_per_min': stats.last_rate
-        })
+        with cursor_lock:
+            return jsonify({
+                'status': 'running',
+                'fetched': stats.fetched,
+                'sent': stats.sent,
+                'added': stats.added,
+                'errors': stats.errors,
+                'rate_per_min': stats.last_rate,
+                'depth_asc': len(cursors_asc),
+                'depth_desc': len(cursors_desc),
+                'depth_total': len(cursors_asc) + len(cursors_desc)
+            })
 
 @app.route('/health', methods=['GET'])
 def health():
