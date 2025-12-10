@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MINI API - UK/Brazil/US Peak Hour Rotation
-Feeds main API with servers from peak regions
+Fixed for SOCKS5 proxies from NAProxy
 """
 
 import os
@@ -20,13 +20,13 @@ PLACE_ID = 109983668079237
 MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-0871.up.railway.app")
 
 # NAProxy API
-NAPROXY_API_URL = "https://api.naproxy.com/web_v1/ip/get-ip-v3"
-NAPROXY_API_KEY = "b6e6673dfb2404d26759eddd1bdf9d12"
+NAPROXY_BASE = "https://api.naproxy.com/web_v1/ip/get-ip-v3"
+NAPROXY_KEY = "b6e6673dfb2404d26759eddd1bdf9d12"
 
 # Proxy settings
-PROXY_COUNT = 15
+PROXY_COUNT = 20
 PROXY_LIFE = 30
-MIN_PROXIES = 8
+MIN_PROXIES = 10
 
 # Peak hours
 PEAK_START = 17
@@ -34,17 +34,17 @@ PEAK_END = 20
 
 # Regions
 REGIONS = [
-    {"name": "UK", "cc": "GB", "utc_offset": 0},
-    {"name": "Brazil", "cc": "BR", "utc_offset": -3},
+    {"name": "UK", "cc": "GB", "state": "", "utc_offset": 0},
+    {"name": "Brazil", "cc": "BR", "state": "", "utc_offset": -3},
     {"name": "US-East", "cc": "US", "state": "NY", "utc_offset": -5},
     {"name": "US-Central", "cc": "US", "state": "TX", "utc_offset": -6},
     {"name": "US-West", "cc": "US", "state": "CA", "utc_offset": -8},
 ]
 
 # Fetching
-FETCH_THREADS = 10
+FETCH_THREADS = 12
 FETCH_INTERVAL = 2
-PAGES_PER_CYCLE = 35
+PAGES_PER_CYCLE = 40
 SEND_BATCH = 500
 
 logging.basicConfig(
@@ -71,45 +71,53 @@ class ProxyPool:
         self.proxies = deque()
         self.region = "Starting"
         self.stats = {'fetched': 0, 'used': 0, 'success': 0, 'errors': 0}
+        self.last_error = None
         
         threading.Thread(target=self._loop, daemon=True).start()
     
+    def _build_url(self, region=None):
+        url = f"{NAPROXY_BASE}?app_key={NAPROXY_KEY}&pt=9&ep=&num={PROXY_COUNT}"
+        if region:
+            url += f"&cc={region.get('cc', '')}&state={region.get('state', '')}"
+        else:
+            url += "&cc=&state="
+        url += f"&city=&life={PROXY_LIFE}&protocol=1&format=txt&lb=%5Cr%5Cn"
+        return url
+    
     def _fetch(self, region=None):
+        name = region['name'] if region else 'Any'
+        
         try:
-            params = {
-                'app_key': NAPROXY_API_KEY,
-                'pt': 9,
-                'num': PROXY_COUNT,
-                'life': PROXY_LIFE,
-                'protocol': 1,
-                'format': 'txt',
-                'lb': '%5Cr%5Cn',
-                'cc': region.get('cc', '') if region else '',
-                'state': region.get('state', '') if region else '',
-                'city': '',
-                'ep': ''
-            }
+            resp = requests.get(self._build_url(region), timeout=15)
+            text = resp.text.strip()
             
-            name = region['name'] if region else 'Any'
-            resp = requests.get(NAPROXY_API_URL, params=params, timeout=10)
+            if 'allow list' in text.lower() or text.startswith('{') or not text:
+                return 0
             
-            if resp.ok:
-                text = resp.text.strip()
-                if text and not text.startswith('{'):
-                    lines = text.replace('\r\n', '\n').split('\n')
-                    expire = time.time() + PROXY_LIFE
-                    
-                    with self.lock:
-                        for line in lines:
-                            line = line.strip()
-                            if line and ':' in line:
-                                self.proxies.append((f"http://{line}", expire))
-                                self.stats['fetched'] += 1
-                        self.region = name
-                    
-                    log.info(f"[PROXY] +{len(lines)} from {name}")
+            lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            expire = time.time() + PROXY_LIFE
+            count = 0
+            
+            with self.lock:
+                for line in lines:
+                    line = line.strip()
+                    if line and ':' in line and not line.startswith('{'):
+                        # SOCKS5 proxy
+                        self.proxies.append((f"socks5://{line}", expire))
+                        count += 1
+                
+                if count > 0:
+                    self.stats['fetched'] += count
+                    self.region = name
+                    self.last_error = None
+            
+            if count > 0:
+                log.info(f"[PROXY] +{count} from {name} (pool: {len(self.proxies)})")
+            
+            return count
         except Exception as e:
-            log.error(f"[PROXY] {e}")
+            self.last_error = str(e)
+            return 0
     
     def _loop(self):
         while True:
@@ -165,13 +173,14 @@ class ProxyPool:
             return {
                 'pool': len(self.proxies),
                 'region': self.region,
-                'success_rate': round(self.stats['success'] / max(1, total) * 100, 1)
+                'success_rate': round(self.stats['success'] / max(1, total) * 100, 1),
+                'last_error': self.last_error
             }
 
 proxies = ProxyPool()
 
 # ==================== STATS ====================
-stats = {'fetched': 0, 'sent': 0, 'added': 0, 'rate': 0}
+stats = {'fetched': 0, 'sent': 0, 'added': 0, 'rate': 0, 'fetch_errors': 0}
 cursors_asc = deque(maxlen=2000)
 cursors_desc = deque(maxlen=2000)
 cursor_lock = threading.Lock()
@@ -201,8 +210,10 @@ def fetch_page(cursor=None, sort='Desc'):
             return data.get('data', []), data.get('nextPageCursor')
         else:
             proxies.error(url)
-    except:
+            stats['fetch_errors'] += 1
+    except Exception as e:
         proxies.error(url)
+        stats['fetch_errors'] += 1
     
     return [], None
 
@@ -210,9 +221,9 @@ def fetch_cycle():
     fetches = [(None, 'Asc'), (None, 'Desc')]
     
     with cursor_lock:
-        for c in list(cursors_asc)[-20:]:
+        for c in list(cursors_asc)[-25:]:
             fetches.append((c, 'Asc'))
-        for c in list(cursors_desc)[-20:]:
+        for c in list(cursors_desc)[-25:]:
             fetches.append((c, 'Desc'))
     
     fetches = fetches[:PAGES_PER_CYCLE]
@@ -265,6 +276,7 @@ def run():
     global stats
     last_log = time.time()
     this_min = 0
+    errors_this_min = 0
     
     while True:
         try:
@@ -283,6 +295,10 @@ def run():
                 regions = [r['name'] for r in peak] if peak else ['Rotating']
                 
                 log.info(f"[{', '.join(regions)}] {this_min}/min | Added: {stats['added']} | Proxies: {pstats['pool']} | {pstats['success_rate']}%")
+                
+                if stats['fetch_errors'] > 0:
+                    log.warning(f"[FETCH] {stats['fetch_errors']} errors")
+                    stats['fetch_errors'] = 0
                 
                 stats['rate'] = this_min
                 this_min = 0
@@ -303,11 +319,7 @@ def status():
         'status': 'running',
         'stats': stats,
         'proxy': proxies.get_stats(),
-        'peak_regions': [r['name'] for r in peak] if peak else ['Rotating'],
-        'all_regions': [
-            {'name': r['name'], 'hour': get_hour(r['utc_offset']), 'is_peak': PEAK_START <= get_hour(r['utc_offset']) < PEAK_END}
-            for r in REGIONS
-        ]
+        'peak_regions': [r['name'] for r in peak] if peak else ['Rotating']
     })
 
 @app.route('/health', methods=['GET'])
@@ -319,7 +331,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8001))
     
     log.info(f"[STARTUP] Mini API on port {port}")
-    log.info(f"[CONFIG] Regions: UK, Brazil, US")
+    log.info(f"[CONFIG] Using SOCKS5 proxies")
     
     # Show status
     for r in REGIONS:
