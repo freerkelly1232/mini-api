@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-MINI API - UK/Brazil/US Peak Hour Rotation
-Fixed for SOCKS5 proxies from NAProxy
+MINI API - Additional Server Fetcher
 """
 
 import os
@@ -9,43 +8,30 @@ import time
 import logging
 import threading
 import requests
+import urllib3
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 import random
-from datetime import datetime, timezone, timedelta
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ==================== CONFIG ====================
 PLACE_ID = 109983668079237
 MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-0871.up.railway.app")
 
-# NAProxy API
-NAPROXY_BASE = "https://api.naproxy.com/web_v1/ip/get-ip-v3"
-NAPROXY_KEY = "b6e6673dfb2404d26759eddd1bdf9d12"
+# NAProxy - US endpoint
+PROXY_HOST = "us.naproxy.net"
+PROXY_PORT = "1000"
+PROXY_USER = "proxy-e5a1ntzmrlr3_area-BR"
+PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Proxy settings
-PROXY_COUNT = 20
-PROXY_LIFE = 30
-MIN_PROXIES = 10
-
-# Peak hours
-PEAK_START = 17
-PEAK_END = 20
-
-# Regions
-REGIONS = [
-    {"name": "UK", "cc": "GB", "state": "", "utc_offset": 0},
-    {"name": "Brazil", "cc": "BR", "state": "", "utc_offset": -3},
-    {"name": "US-East", "cc": "US", "state": "NY", "utc_offset": -5},
-    {"name": "US-Central", "cc": "US", "state": "TX", "utc_offset": -6},
-    {"name": "US-West", "cc": "US", "state": "CA", "utc_offset": -8},
-]
-
-# Fetching
-FETCH_THREADS = 12
-FETCH_INTERVAL = 2
-PAGES_PER_CYCLE = 40
-SEND_BATCH = 500
+# Reduced fetching (proxy friendly)
+FETCH_THREADS = 4
+FETCH_INTERVAL = 3
+PAGES_PER_CYCLE = 20
+SEND_BATCH_SIZE = 500
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,292 +42,246 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ==================== PEAK FINDER ====================
-def get_hour(offset):
-    utc = datetime.now(timezone.utc)
-    return (utc + timedelta(hours=offset)).hour
-
-def get_peak_regions():
-    return [r for r in REGIONS if PEAK_START <= get_hour(r['utc_offset']) < PEAK_END]
-
-# ==================== PROXY POOL ====================
-class ProxyPool:
+# ==================== STATE ====================
+class Stats:
     def __init__(self):
         self.lock = threading.Lock()
-        self.proxies = deque()
-        self.region = "Starting"
-        self.stats = {'fetched': 0, 'used': 0, 'success': 0, 'errors': 0}
-        self.last_error = None
-        
-        threading.Thread(target=self._loop, daemon=True).start()
-    
-    def _build_url(self, region=None):
-        url = f"{NAPROXY_BASE}?app_key={NAPROXY_KEY}&pt=9&ep=&num={PROXY_COUNT}"
-        if region:
-            url += f"&cc={region.get('cc', '')}&state={region.get('state', '')}"
-        else:
-            url += "&cc=&state="
-        url += f"&city=&life={PROXY_LIFE}&protocol=1&format=txt&lb=%5Cr%5Cn"
-        return url
-    
-    def _fetch(self, region=None):
-        name = region['name'] if region else 'Any'
-        
-        try:
-            resp = requests.get(self._build_url(region), timeout=15)
-            text = resp.text.strip()
-            
-            if 'allow list' in text.lower() or text.startswith('{') or not text:
-                return 0
-            
-            lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-            expire = time.time() + PROXY_LIFE
-            count = 0
-            
-            with self.lock:
-                for line in lines:
-                    line = line.strip()
-                    if line and ':' in line and not line.startswith('{'):
-                        # SOCKS5 proxy
-                        self.proxies.append((f"socks5://{line}", expire))
-                        count += 1
-                
-                if count > 0:
-                    self.stats['fetched'] += count
-                    self.region = name
-                    self.last_error = None
-            
-            if count > 0:
-                log.info(f"[PROXY] +{count} from {name} (pool: {len(self.proxies)})")
-            
-            return count
-        except Exception as e:
-            self.last_error = str(e)
-            return 0
-    
-    def _loop(self):
-        while True:
-            try:
-                now = time.time()
-                with self.lock:
-                    self.proxies = deque(p for p in self.proxies if p[1] > now)
-                    size = len(self.proxies)
-                
-                if size < MIN_PROXIES:
-                    peak = get_peak_regions()
-                    region = random.choice(peak) if peak else random.choice(REGIONS)
-                    self._fetch(region)
-                
-                time.sleep(5)
-            except:
-                time.sleep(2)
-    
-    def get(self):
-        with self.lock:
-            now = time.time()
-            self.proxies = deque(p for p in self.proxies if p[1] > now)
-            
-            if self.proxies:
-                url, exp = random.choice(list(self.proxies))
-                if exp - now > 5:
-                    self.stats['used'] += 1
-                    return {'http': url, 'https': url}, url
-        
-        peak = get_peak_regions()
-        self._fetch(random.choice(peak) if peak else random.choice(REGIONS))
-        
-        with self.lock:
-            if self.proxies:
-                url, _ = self.proxies[0]
-                self.stats['used'] += 1
-                return {'http': url, 'https': url}, url
-        return None, None
-    
-    def success(self):
-        with self.lock:
-            self.stats['success'] += 1
-    
-    def error(self, url=None):
-        with self.lock:
-            self.stats['errors'] += 1
-            if url:
-                self.proxies = deque(p for p in self.proxies if p[0] != url)
-    
-    def get_stats(self):
-        with self.lock:
-            total = self.stats['success'] + self.stats['errors']
-            return {
-                'pool': len(self.proxies),
-                'region': self.region,
-                'success_rate': round(self.stats['success'] / max(1, total) * 100, 1),
-                'last_error': self.last_error
-            }
+        self.fetched = 0
+        self.sent = 0
+        self.added = 0
+        self.errors = 0
+        self.last_rate = 0
 
-proxies = ProxyPool()
+stats = Stats()
 
-# ==================== STATS ====================
-stats = {'fetched': 0, 'sent': 0, 'added': 0, 'rate': 0, 'fetch_errors': 0}
-cursors_asc = deque(maxlen=2000)
-cursors_desc = deque(maxlen=2000)
+# Deep cursor storage for both directions
+cursors_asc = deque(maxlen=1500)
+cursors_desc = deque(maxlen=1500)
 cursor_lock = threading.Lock()
 
+# ==================== PROXY ====================
+def get_proxy():
+    session_id = f"mini{random.randint(100000, 999999)}"
+    proxy_url = f"http://{PROXY_USER}_session-{session_id}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+    return {'http': proxy_url, 'https': proxy_url}
+
 # ==================== FETCHING ====================
-def fetch_page(cursor=None, sort='Desc'):
-    proxy, url = proxies.get()
-    if not proxy:
-        return [], None
+def fetch_page(cursor=None, sort_order='Desc'):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+            params = {
+                'sortOrder': sort_order,
+                'limit': 100,
+                'excludeFullGames': 'true'
+            }
+            if cursor:
+                params['cursor'] = cursor
+            
+            resp = requests.get(
+                url,
+                params=params,
+                proxies=get_proxy(),
+                timeout=15,
+                verify=False,  # Disable SSL verification for proxy
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'}
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get('data', []), data.get('nextPageCursor'), sort_order
+            elif resp.status_code == 429:
+                log.warning("[RATELIMIT] 429 from Roblox")
+                time.sleep(2)
+                return [], None, sort_order
+            else:
+                log.warning(f"[FETCH] Status {resp.status_code}")
+                return [], None, sort_order
+            
+        except requests.exceptions.SSLError as e:
+            log.error(f"[SSL ERROR] {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            with stats.lock:
+                stats.errors += 1
+            return [], None, sort_order
+        except requests.exceptions.ConnectionError as e:
+            log.error(f"[CONN ERROR] {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            with stats.lock:
+                stats.errors += 1
+            return [], None, sort_order
+        except requests.exceptions.ProxyError as e:
+            log.error(f"[PROXY ERROR] {e}")
+            with stats.lock:
+                stats.errors += 1
+            return [], None, sort_order
+        except Exception as e:
+            log.error(f"[ERROR] {type(e).__name__}: {e}")
+            with stats.lock:
+                stats.errors += 1
+            return [], None, sort_order
     
-    try:
-        params = {'sortOrder': sort, 'limit': 100, 'excludeFullGames': 'true'}
-        if cursor:
-            params['cursor'] = cursor
-        
-        resp = requests.get(
-            f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public",
-            params=params,
-            proxies=proxy,
-            timeout=15,
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            proxies.success()
-            return data.get('data', []), data.get('nextPageCursor')
-        else:
-            proxies.error(url)
-            stats['fetch_errors'] += 1
-    except Exception as e:
-        proxies.error(url)
-        stats['fetch_errors'] += 1
-    
-    return [], None
+    return [], None, sort_order
 
 def fetch_cycle():
-    fetches = [(None, 'Asc'), (None, 'Desc')]
+    global cursors_asc, cursors_desc
     
+    fetches = []
+    
+    # Start fresh from both ends
+    fetches.append((None, 'Asc'))
+    fetches.append((None, 'Desc'))
+    
+    # Prioritize DEEP cursors (closer to middle where 5-7 player servers are)
     with cursor_lock:
-        for c in list(cursors_asc)[-25:]:
-            fetches.append((c, 'Asc'))
-        for c in list(cursors_desc)[-25:]:
-            fetches.append((c, 'Desc'))
+        asc_list = list(cursors_asc)
+        desc_list = list(cursors_desc)
+        
+        # Take deepest cursors (end of list)
+        if asc_list:
+            deep_asc = asc_list[-min(15, len(asc_list)):]
+            for c in deep_asc:
+                fetches.append((c, 'Asc'))
+        
+        if desc_list:
+            deep_desc = desc_list[-min(15, len(desc_list)):]
+            for c in deep_desc:
+                fetches.append((c, 'Desc'))
     
     fetches = fetches[:PAGES_PER_CYCLE]
     
-    servers = []
+    all_servers = []
     seen = set()
-    new_asc, new_desc = [], []
+    new_asc = []
+    new_desc = []
     
-    with ThreadPoolExecutor(max_workers=FETCH_THREADS) as ex:
-        futures = {ex.submit(fetch_page, c, s): s for c, s in fetches}
+    with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
+        futures = {executor.submit(fetch_page, c, s): (c, s) for c, s in fetches}
         
-        for f in as_completed(futures):
+        for future in as_completed(futures):
             try:
-                data, cursor = f.result()
-                for s in data:
+                servers, next_cursor, sort_order = future.result()
+                
+                for s in servers:
                     sid = s.get('id')
                     players = s.get('playing', 0)
-                    if players >= 5 and sid and sid not in seen:
+                    
+                    # Skip servers with less than 5 players
+                    if players < 5:
+                        continue
+                    
+                    if sid and sid not in seen:
                         seen.add(sid)
-                        servers.append({'id': sid, 'players': players})
+                        all_servers.append({'id': sid, 'players': players})
                 
-                if cursor:
-                    (new_asc if futures[f] == 'Asc' else new_desc).append(cursor)
-            except:
-                pass
+                if next_cursor:
+                    if sort_order == 'Asc':
+                        new_asc.append(next_cursor)
+                    else:
+                        new_desc.append(next_cursor)
+                        
+            except Exception as e:
+                log.error(f"[CYCLE] Future error: {e}")
     
+    # Store new cursors (go deeper)
     with cursor_lock:
-        cursors_asc.extend(new_asc)
-        cursors_desc.extend(new_desc)
+        for c in new_asc:
+            cursors_asc.append(c)
+        for c in new_desc:
+            cursors_desc.append(c)
     
-    return servers
+    return all_servers
 
 def send_to_main(servers):
     if not servers:
         return 0
     
-    total = 0
-    for i in range(0, len(servers), SEND_BATCH):
-        batch = servers[i:i + SEND_BATCH]
+    total_added = 0
+    
+    for i in range(0, len(servers), SEND_BATCH_SIZE):
+        batch = servers[i:i + SEND_BATCH_SIZE]
         try:
-            resp = requests.post(f"{MAIN_API_URL}/add-pool", json={'servers': batch, 'source': 'mini'}, timeout=10)
+            resp = requests.post(
+                f"{MAIN_API_URL}/add-pool",
+                json={'servers': batch, 'source': 'mini-api'},
+                timeout=10
+            )
             if resp.ok:
-                total += resp.json().get('added', 0)
-        except:
-            pass
-    return total
+                total_added += resp.json().get('added', 0)
+        except Exception as e:
+            log.error(f"Send error: {e}")
+    
+    return total_added
 
 # ==================== MAIN LOOP ====================
-def run():
-    global stats
+def run_loop():
     last_log = time.time()
-    this_min = 0
-    errors_this_min = 0
+    servers_this_min = 0
     
     while True:
         try:
             servers = fetch_cycle()
-            stats['fetched'] += len(servers)
+            
+            with stats.lock:
+                stats.fetched += len(servers)
             
             if servers:
                 added = send_to_main(servers)
-                stats['sent'] += len(servers)
-                stats['added'] += added
-                this_min += len(servers)
+                
+                with stats.lock:
+                    stats.sent += len(servers)
+                    stats.added += added
+                
+                servers_this_min += len(servers)
             
             if time.time() - last_log >= 60:
-                pstats = proxies.get_stats()
-                peak = get_peak_regions()
-                regions = [r['name'] for r in peak] if peak else ['Rotating']
-                
-                log.info(f"[{', '.join(regions)}] {this_min}/min | Added: {stats['added']} | Proxies: {pstats['pool']} | {pstats['success_rate']}%")
-                
-                if stats['fetch_errors'] > 0:
-                    log.warning(f"[FETCH] {stats['fetch_errors']} errors")
-                    stats['fetch_errors'] = 0
-                
-                stats['rate'] = this_min
-                this_min = 0
+                with stats.lock:
+                    stats.last_rate = servers_this_min
+                with cursor_lock:
+                    depth = len(cursors_asc) + len(cursors_desc)
+                log.info(f"[RATE] {servers_this_min}/min | Sent: {stats.sent} | Added: {stats.added} | Depth: {depth}")
+                servers_this_min = 0
                 last_log = time.time()
-            
-            time.sleep(FETCH_INTERVAL)
-            
+                
         except Exception as e:
-            log.error(f"Error: {e}")
-            time.sleep(1)
+            log.error(f"Loop error: {e}")
+        
+        time.sleep(FETCH_INTERVAL)
 
 # ==================== ENDPOINTS ====================
 @app.route('/', methods=['GET'])
 @app.route('/status', methods=['GET'])
 def status():
-    peak = get_peak_regions()
-    return jsonify({
-        'status': 'running',
-        'stats': stats,
-        'proxy': proxies.get_stats(),
-        'peak_regions': [r['name'] for r in peak] if peak else ['Rotating']
-    })
+    with stats.lock:
+        with cursor_lock:
+            return jsonify({
+                'status': 'running',
+                'fetched': stats.fetched,
+                'sent': stats.sent,
+                'added': stats.added,
+                'errors': stats.errors,
+                'rate_per_min': stats.last_rate,
+                'depth_asc': len(cursors_asc),
+                'depth_desc': len(cursors_desc),
+                'depth_total': len(cursors_asc) + len(cursors_desc)
+            })
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'proxies': proxies.get_stats()['pool']})
+    return jsonify({'status': 'ok'})
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8001))
     
     log.info(f"[STARTUP] Mini API on port {port}")
-    log.info(f"[CONFIG] Using SOCKS5 proxies")
+    log.info(f"[CONFIG] Threads={FETCH_THREADS} | Main API={MAIN_API_URL}")
     
-    # Show status
-    for r in REGIONS:
-        hour = get_hour(r['utc_offset'])
-        status = "🟢 PEAK" if PEAK_START <= hour < PEAK_END else ""
-        log.info(f"  {r['name']}: {hour}:00 {status}")
+    threading.Thread(target=run_loop, daemon=True).start()
     
-    # Start
-    peak = get_peak_regions()
-    proxies._fetch(random.choice(peak) if peak else random.choice(REGIONS))
-    
-    threading.Thread(target=run, daemon=True).start()
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
