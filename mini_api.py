@@ -24,7 +24,7 @@ MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-api-production-0871.
 # NAProxy - US endpoint
 PROXY_HOST = "us.naproxy.net"
 PROXY_PORT = "1000"
-PROXY_USER = "proxy-e5a1ntzmrlr3_area-BR"
+PROXY_USER = "proxy-e5a1ntzmrlr3"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
 # Reduced fetching (proxy friendly)
